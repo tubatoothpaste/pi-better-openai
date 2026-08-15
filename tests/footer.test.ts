@@ -212,6 +212,32 @@ describe("footer mode ownership", () => {
     footer.dispose();
   });
 
+  test("keeps regular extension statuses left and right-suffixed statuses right", async () => {
+    const cwd = createTempProject();
+    writeProjectConfig(cwd, "replace");
+    const harness = createHarness(cwd);
+
+    await emit(harness, "session_start");
+    const footerFactory = harness.setFooter.mock.calls[0]?.[0];
+    const footer = footerFactory(
+      { requestRender: vi.fn() },
+      { fg: (_color: string, value: string) => value },
+      {
+        getExtensionStatuses: () =>
+          new Map([
+            ["mcp", "MCP: playwright"],
+            ["disk-usage:right", "C:\\ 50%"],
+          ]),
+      },
+    );
+
+    const statusLine = footer.render(50).at(-1)!;
+    expect(statusLine.startsWith("MCP: playwright")).toBe(true);
+    expect(statusLine.endsWith("C:\\ 50%")).toBe(true);
+    expect(statusLine).toHaveLength(50);
+    footer.dispose();
+  });
+
   test("adds completed-turn usage without rescanning the full session", async () => {
     const cwd = createTempProject();
     writeProjectConfig(cwd, "replace");

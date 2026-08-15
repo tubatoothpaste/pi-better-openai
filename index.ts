@@ -66,6 +66,7 @@ import { PetFooterController } from "./src/pet-footer-controller.ts";
 import {
   abbreviateHomePath,
   combineInlinePetFooter,
+  layoutFooterStatusLines,
   isInlinePetPlacement,
   isTerminalImageLine,
   petSizeCellsForPlacement,
@@ -77,6 +78,7 @@ const OPENAI_SETTINGS_COMMAND = "openai-settings";
 const FLAG = "fast";
 const PET_EMPTY_VALUE = "not selected";
 const SERVICE_TIER = "priority";
+const RIGHT_ALIGNED_STATUS_SUFFIX = ":right";
 type SettingsPickerItem = {
   id: string;
   label: string;
@@ -1043,11 +1045,26 @@ export default function betterOpenAI(pi: ExtensionAPI): void {
 
           const extensionStatuses = footerData.getExtensionStatuses?.();
           if (extensionStatuses?.size) {
-            const statusLine = Array.from(extensionStatuses.entries())
-              .sort(([a], [b]) => String(a).localeCompare(String(b)))
-              .map(([, text]) => sanitizeStatusText(String(text)))
-              .join(" ");
-            textLines.push(truncateToWidth(statusLine, footerTextWidth, theme.fg("dim", "...")));
+            const leftStatuses: string[] = [];
+            const rightStatuses: string[] = [];
+            for (const [key, text] of Array.from(extensionStatuses.entries()).sort(([a], [b]) =>
+              String(a).localeCompare(String(b)),
+            )) {
+              const status = sanitizeStatusText(String(text));
+              if (!status) continue;
+              (String(key).endsWith(RIGHT_ALIGNED_STATUS_SUFFIX)
+                ? rightStatuses
+                : leftStatuses
+              ).push(status);
+            }
+            textLines.push(
+              ...layoutFooterStatusLines(
+                leftStatuses,
+                rightStatuses,
+                footerTextWidth,
+                theme.fg("dim", " · "),
+              ),
+            );
           }
 
           const petLines = petController.renderPetLines(ctx, cfg, {

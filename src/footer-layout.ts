@@ -28,6 +28,66 @@ function padTextToWidth(value: string, width: number): string {
   return value + spaces(width - visibleWidth(value));
 }
 
+export function alignFooterStatusLine(left: string, right: string, width: number): string {
+  const availableWidth = Math.max(0, width);
+  if (availableWidth === 0) return "";
+
+  const clippedRight = truncateToWidth(right, availableWidth, "");
+  const rightWidth = visibleWidth(clippedRight);
+  if (!left) return spaces(availableWidth - rightWidth) + clippedRight;
+  if (!clippedRight) return truncateToWidth(left, availableWidth, "...");
+
+  const maxLeftWidth = Math.max(0, availableWidth - rightWidth - 1);
+  const clippedLeft = truncateToWidth(left, maxLeftWidth, maxLeftWidth >= 3 ? "..." : "");
+  const leftWidth = visibleWidth(clippedLeft);
+  if (leftWidth === 0) return spaces(availableWidth - rightWidth) + clippedRight;
+
+  return clippedLeft + spaces(availableWidth - leftWidth - rightWidth) + clippedRight;
+}
+
+export function layoutFooterStatusLines(
+  leftStatuses: string[],
+  rightStatuses: string[],
+  width: number,
+  separator = " · ",
+): string[] {
+  const availableWidth = Math.max(0, width);
+  if (availableWidth === 0) return [];
+
+  const left = leftStatuses.filter(Boolean).join(" ");
+  const rightSegments = rightStatuses.filter(Boolean);
+  if (rightSegments.length === 0) {
+    const line = truncateToWidth(left, availableWidth, "...");
+    return line ? [line] : [];
+  }
+
+  const right = rightSegments.join(separator);
+  if (
+    visibleWidth(right) <= availableWidth &&
+    (!left || visibleWidth(left) + 1 + visibleWidth(right) <= availableWidth)
+  ) {
+    return [alignFooterStatusLine(left, right, availableWidth)];
+  }
+
+  const lines: string[] = [];
+  if (left) lines.push(truncateToWidth(left, availableWidth, "..."));
+
+  let current = "";
+  for (const segment of rightSegments) {
+    const clippedSegment = truncateToWidth(segment, availableWidth, "...");
+    const candidate = current ? `${current}${separator}${clippedSegment}` : clippedSegment;
+    if (current && visibleWidth(candidate) > availableWidth) {
+      lines.push(current);
+      current = clippedSegment;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current) lines.push(current);
+
+  return lines;
+}
+
 export function isTerminalImageLine(line: string): boolean {
   return line.includes("\x1b_G") || line.includes("\x1b]1337;File=");
 }
