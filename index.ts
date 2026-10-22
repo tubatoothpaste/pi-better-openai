@@ -186,7 +186,12 @@ export default function betterOpenAI(pi: ExtensionAPI): void {
   let sessionNameCached = false;
   let cachedSessionNameLeafId: string | null | undefined;
   let cachedSessionName: string | undefined;
-  const usageController = new UsageController(config, updateFooter);
+  const usageController = new UsageController(config, updateFooter, (update) => {
+    pi.events?.emit("pi-better-openai:usage-credits", update);
+  });
+  const unsubscribeCredits = pi.events?.on("pi-better-openai:usage-credits-request", () =>
+    usageController.republishCredits(),
+  );
   const petController = new PetFooterController(config, updateFooter, () => footerInstalled);
 
   function refresh(ctx: ExtensionContext): ResolvedConfig {
@@ -1266,6 +1271,7 @@ export default function betterOpenAI(pi: ExtensionAPI): void {
     invalidateContextUsage();
     invalidateSessionName();
     usageController.shutdown();
+    unsubscribeCredits?.();
     petController.shutdown();
   });
 

@@ -52,6 +52,19 @@ In replacement-footer mode, extensions can publish through `ctx.ui.setStatus(key
 
 Keys sort within their groups. Text is sanitized and constrained to the available terminal width, including inline-pet layouts. Remove a status by setting it to `undefined`. Run `/reload` in existing sessions after changing the renderer or producer. Other footer modes/renderers may lay out statuses differently.
 
+## Shared quota and credit collection
+
+The usage controller now shares a private, account-keyed cache across Pi sessions in the same agent directory. One lock owner reads `https://chatgpt.com/backend-api/wham/usage`; that response supplies **both quota windows and usage credits**. Followers reuse it, including default/Spark views with the original measurement timestamp, so reset countdowns do not move forward on cache reads.
+
+- Local cache checks run every five seconds. The configured usage refresh interval controls API freshness (default one minute); the shortest interval among active sessions can refresh the shared cache. Startup and model changes do not bypass fresh shared data. `/openai-usage` allows an explicit refresh after a five-second shared cooldown, but never bypasses shared failure backoff.
+- Failed requests retain last good data with stale/error labels. Retry delays grow from one to five minutes, honoring longer Retry-After values up to one hour. Unknown credits are not zero.
+- Storage is `<agent-dir>/cache/openai-usage-v1/`: private directory, atomic mode-0600 snapshots, SHA-256 account/endpoint keys, only normalized measurements/backoff metadata. No tokens, credentials, raw account IDs or raw API responses are persisted. Missing/malformed/foreign/future caches are not trusted; an unsafe cache directory fails closed rather than starting uncoordinated requests.
+- Ownership is an exclusive directory plus a unique process/token marker. Dead-process markers are reclaimed; empty crash windows recover after 30 seconds. Release/reaping never recursively deletes a successor's lock. A live owner is not evicted by age; requests have a ten-second timeout. An event-loop-stalled live process may require closing that session. No permanent leader or background daemon is installed.
+- The same Pi credential resolution remains in use. Account changes cannot reuse another account's cached data. Separate agent directories intentionally remain separate collection scopes.
+- Sanitized `pi-better-openai:usage-credits` events feed the optional global credits-status producer. Its startup `pi-better-openai:usage-credits-request` event replays the last value. Events contain version, credits, observedAt, stale/error flags; `undefined` hides an ineligible/disabled indicator. No raw account keys or credentials leave the controller.
+
+The token watcher is entirely independent and unchanged: it can continue its own management/polling, or be stopped without freezing Pi footers. Reset and broadcast policies are not altered. Reload **all existing Pi sessions** to replace their old readers; old code continues its old behavior until reloaded. No model-generation requests are used for this monitoring. Fast mode, images, pets and footer layout retain their existing behavior.
+
 ## Configuration
 
 The extension reads JSON config from two locations:

@@ -13,6 +13,7 @@ type UsageHarness = {
   ctx: ExtensionContext;
   handlers: Map<string, EventHandler[]>;
   commands: Map<string, { handler: CommandHandler }>;
+  events: ReturnType<typeof vi.fn>;
 };
 
 const tempDirs: string[] = [];
@@ -70,6 +71,7 @@ function writeProjectConfig(cwd: string, config: Record<string, unknown>): void 
 
 function usageResponseBody() {
   return {
+    credits: { balance: "1234.56", unlimited: false },
     rate_limit: {
       allowed: true,
       primary_window: { used_percent: 10, reset_after_seconds: 60 },
@@ -115,7 +117,9 @@ async function createUsageHarness(options: {
 
   const handlers = new Map<string, EventHandler[]>();
   const commands = new Map<string, { handler: CommandHandler }>();
+  const events = vi.fn();
   const pi = {
+    events: { emit: events, on: vi.fn() },
     on(event: string, handler: EventHandler) {
       const currentHandlers = handlers.get(event) ?? [];
       currentHandlers.push(handler);
@@ -154,7 +158,7 @@ async function createUsageHarness(options: {
   } as unknown as ExtensionContext;
 
   betterOpenAI(pi);
-  return { ctx, handlers, commands };
+  return { ctx, handlers, commands, events };
 }
 
 async function emit(harness: UsageHarness, event: string, payload: unknown = {}): Promise<void> {
@@ -170,6 +174,7 @@ async function settleAsyncWork(): Promise<void> {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
   vi.clearAllMocks();
   vi.useRealTimers();
   if (originalPiCodingAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -519,7 +524,7 @@ describe("usage polling lifecycle", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  test("forces refreshes for model selection and manual usage status", async () => {
+  test("model selection reuses shared data and manual refresh honors a short shared cooldown", async () => {
     const fetchMock = stubUsageFetch(usageJsonResponse);
     const harness = await createUsageHarness({
       usageConfig: {
@@ -534,11 +539,21 @@ describe("usage polling lifecycle", () => {
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     harness.ctx.model = { provider: "openai", id: "gpt-5.5" } as ExtensionContext["model"];
     await emit(harness, "model_select", { model: harness.ctx.model });
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() =>
+      expect(harness.ctx.ui.setStatus).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.stringContaining("Usage:"),
+      ),
+    );
     await harness.commands.get("openai-usage")?.handler("", harness.ctx);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now + 6000);
+    await harness.commands.get("openai-usage")?.handler("", harness.ctx);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
     await emit(harness, "session_shutdown");
 
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(harness.ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Usage:"), "info");
   });
 
@@ -562,14 +577,49 @@ describe("usage polling lifecycle", () => {
     await harness.commands.get("openai-usage")?.handler("", harness.ctx);
     await emit(harness, "session_shutdown");
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(harness.ctx.ui.notify).toHaveBeenCalledWith(
-      expect.stringContaining("Codex usage request failed (500)"),
+      expect.stringContaining("Shared usage refresh failed"),
       "warning",
     );
   });
 
-  test("hides a successful snapshot and reports a later refresh failure", async () => {
+  test("publishes credit events from the same fetch and never keeps a previous account balance", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(usageJsonResponse())
+      .mockResolvedValueOnce(new Response("failed", { status: 500 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const harness = await createUsageHarness({ isUsingOAuth: true });
+    await emit(harness, "session_start");
+    await vi.waitFor(() =>
+      expect(harness.events).toHaveBeenCalledWith(
+        "pi-better-openai:usage-credits",
+        expect.objectContaining({
+          credits: { balance: "1234.56", unlimited: false },
+          error: false,
+        }),
+      ),
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    vi.mocked(harness.ctx.modelRegistry.getApiKeyForProvider).mockResolvedValue(
+      JSON.stringify({ access: "second-token", accountId: "second-account" }),
+    );
+    await harness.commands.get("openai-usage")?.handler("", harness.ctx);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(harness.events).toHaveBeenLastCalledWith(
+      "pi-better-openai:usage-credits",
+      expect.objectContaining({ credits: null, error: true }),
+    );
+    harness.ctx.model = { provider: "anthropic", id: "other-model" } as ExtensionContext["model"];
+    await emit(harness, "model_select", { model: harness.ctx.model });
+    await vi.waitFor(() =>
+      expect(harness.events).toHaveBeenLastCalledWith("pi-better-openai:usage-credits", undefined),
+    );
+    await emit(harness, "session_shutdown");
+  });
+
+  test("labels the last good snapshot stale and reports a later shared refresh failure", async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(usageJsonResponse())
@@ -587,17 +637,29 @@ describe("usage polling lifecycle", () => {
 
     await emit(harness, "session_start");
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() =>
+      expect(harness.ctx.ui.setStatus).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.stringContaining("Usage:"),
+      ),
+    );
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now + 6000);
     await harness.commands.get("openai-usage")?.handler("", harness.ctx);
+    expect(harness.ctx.ui.setStatus).toHaveBeenLastCalledWith(
+      expect.any(String),
+      expect.stringContaining("stale (refresh failed)"),
+    );
     await emit(harness, "session_shutdown");
 
     expect(harness.ctx.ui.notify).toHaveBeenLastCalledWith(
-      expect.stringContaining("Codex usage request failed (500)"),
+      expect.stringContaining("Shared usage refresh failed"),
       "warning",
     );
     expect(harness.ctx.ui.notify).not.toHaveBeenLastCalledWith(
       expect.stringContaining("5h: 90%"),
       expect.anything(),
     );
-    expect(harness.ctx.ui.setStatus).toHaveBeenLastCalledWith(expect.any(String), undefined);
+    expect(harness.events).toHaveBeenLastCalledWith("pi-better-openai:usage-credits", undefined);
   });
 });

@@ -6,12 +6,18 @@ import {
   type UsageSnapshot,
   formatResetCountdown,
   formatUsageSnapshot,
-  parseUsageSnapshot,
   readCodexAuth,
-  requestCodexUsage,
   usageScopeForModel,
 } from "./usage.ts";
 import { currentModelKey } from "./fast-controller.ts";
+import { getCodexCredentials } from "./codex-auth.ts";
+import {
+  sharedUsage,
+  usageAccountKey,
+  LOCAL_CHECK_MS,
+  type Credits,
+  type CreditsUpdate,
+} from "./shared-usage.ts";
 
 export function isOpenAISubscriptionModel(
   ctx: ExtensionContext,
@@ -44,6 +50,9 @@ type QueuedUsageRefresh = {
 
 export class UsageController {
   private usageSnapshot: UsageSnapshot | undefined;
+  private credits: Credits | null = null;
+  private accountKey: string | undefined;
+  private creditsUpdate: CreditsUpdate | undefined;
   private usageUpdatedAt: number | undefined;
   private usageError: string | undefined;
   private usageLastFetchAt: number | undefined;
@@ -57,13 +66,37 @@ export class UsageController {
   private sessionGeneration = 0;
   private readonly getConfig: (ctx: ExtensionContext) => ResolvedConfig;
   private readonly updateFooter: (ctx: ExtensionContext) => void;
+  private readonly publishCredits: (update: CreditsUpdate | undefined) => void;
 
   constructor(
     getConfig: (ctx: ExtensionContext) => ResolvedConfig,
     updateFooter: (ctx: ExtensionContext) => void,
+    publishCredits: (update: CreditsUpdate | undefined) => void = () => undefined,
   ) {
     this.getConfig = getConfig;
     this.updateFooter = updateFooter;
+    this.publishCredits = publishCredits;
+  }
+
+  republishCredits(): void {
+    this.publishCredits(this.creditsUpdate);
+  }
+
+  private updateCredits(ctx: ExtensionContext): void {
+    const cfg = this.getConfig(ctx);
+    this.creditsUpdate =
+      cfg.usage.enabled && isOpenAISubscriptionModel(ctx, cfg)
+        ? {
+            version: 1,
+            credits: this.credits,
+            observedAt: this.usageUpdatedAt ?? null,
+            stale:
+              this.usageUpdatedAt !== undefined &&
+              Date.now() - this.usageUpdatedAt > Math.max(120_000, cfg.usage.refreshIntervalMs * 2),
+            error: Boolean(this.usageError),
+          }
+        : undefined;
+    this.republishCredits();
   }
 
   get snapshot(): UsageSnapshot | undefined {
@@ -76,11 +109,10 @@ export class UsageController {
     isUsingOAuth?: boolean,
   ): string | undefined {
     return this.usageSnapshot &&
-      !this.usageError &&
       this.usageSnapshot.scope === usageScopeForModel(ctx.model?.id) &&
       cfg.usage.enabled &&
       isOpenAISubscriptionModel(ctx, cfg, isUsingOAuth)
-      ? formatUsageSnapshot(this.usageSnapshot, cfg.usage)
+      ? `${formatUsageSnapshot(this.usageSnapshot, cfg.usage)}${this.usageError ? " | stale (refresh failed)" : Date.now() - this.usageSnapshot.capturedAt > Math.max(120_000, cfg.usage.refreshIntervalMs * 2) ? " | stale" : ""}`
       : undefined;
   }
 
@@ -109,7 +141,7 @@ export class UsageController {
       `Requires subscription model: ${cfg.usage.showOnlyOnSubscriptionModels}`,
       `Auth: ${auth ? "found" : "missing"}`,
       `Account ID: ${maskIdentifier(auth?.accountId) ?? "none"}`,
-      `Last fetch: ${this.usageLastFetchAt ? new Date(this.usageLastFetchAt).toLocaleTimeString() : "never"}`,
+      `Last local cache check: ${this.usageLastFetchAt ? new Date(this.usageLastFetchAt).toLocaleTimeString() : "never"}`,
       `Last successful update: ${this.usageUpdatedAt ? new Date(this.usageUpdatedAt).toLocaleTimeString() : "never"}`,
       `Last error: ${this.usageError ?? "none"}`,
       `Refresh interval: ${cfg.usage.refreshIntervalMs}ms`,
@@ -129,6 +161,8 @@ export class UsageController {
     this.usageAbortController?.abort();
     this.usageAbortController = undefined;
     this.stopTimer();
+    this.creditsUpdate = undefined;
+    this.republishCredits();
   }
 
   private handleStaleContextError(error: unknown, generation: number): boolean {
@@ -175,11 +209,13 @@ export class UsageController {
       if (!cfg.usage.enabled) {
         this.usageSnapshot = undefined;
         this.usageError = "Usage display is disabled.";
+        this.updateCredits(ctx);
         this.updateFooter(ctx);
         if (options?.notify) ctx.ui.notify(this.formatStatus(ctx), "warning");
         return;
       }
       if (!isOpenAISubscriptionModel(ctx, cfg)) {
+        this.updateCredits(ctx);
         this.updateFooter(ctx);
         if (options?.notify) ctx.ui.notify(this.formatStatus(ctx), "warning");
         return;
@@ -188,7 +224,7 @@ export class UsageController {
         !options?.force &&
         !options?.notify &&
         this.usageLastFetchAt !== undefined &&
-        Date.now() - this.usageLastFetchAt < cfg.usage.refreshIntervalMs;
+        Date.now() - this.usageLastFetchAt < LOCAL_CHECK_MS;
       if (shouldThrottle) return;
       this.usageLastFetchAt = Date.now();
       this.usageAbortController = new AbortController();
@@ -196,24 +232,49 @@ export class UsageController {
       const signal = ctx.signal
         ? AbortSignal.any([ctx.signal, timeoutSignal, this.usageAbortController.signal])
         : AbortSignal.any([timeoutSignal, this.usageAbortController.signal]);
-      const data = await requestCodexUsage(ctx, signal);
+      const credentials = await getCodexCredentials(ctx, signal);
+      if (!this.isGenerationCurrent(generation)) return;
+      const accountKey = credentials ? usageAccountKey(credentials.accountId) : undefined;
+      if (accountKey !== this.accountKey) {
+        this.accountKey = accountKey;
+        this.usageSnapshot = undefined;
+        this.usageUpdatedAt = undefined;
+        this.credits = null;
+        this.updateCredits(ctx);
+      }
+      const data = credentials
+        ? await sharedUsage(credentials, cfg.usage.refreshIntervalMs, signal, {
+            force: options?.notify,
+          })
+        : undefined;
       if (!this.isGenerationCurrent(generation)) return;
 
-      this.usageSnapshot = data ? parseUsageSnapshot(data, resolvedModelId) : undefined;
-      this.usageUpdatedAt = this.usageSnapshot ? Date.now() : undefined;
-      this.usageError = data
-        ? undefined
-        : `Missing openai-codex OAuth credentials in ${AUTH_FILE}.`;
+      this.usageSnapshot = data?.sample?.[usageScopeForModel(resolvedModelId)];
+      this.usageUpdatedAt = this.usageSnapshot?.capturedAt;
+      this.credits = data?.sample?.credits ?? null;
+      this.usageError = !credentials
+        ? `Missing openai-codex OAuth credentials in ${AUTH_FILE}.`
+        : data?.error
+          ? "Shared usage refresh failed; retry is backed off."
+          : undefined;
+      this.updateCredits(ctx);
       this.updateFooter(ctx);
       if (options?.notify)
-        ctx.ui.notify(this.formatStatus(ctx), this.usageSnapshot ? "info" : "warning");
+        ctx.ui.notify(
+          this.formatStatus(ctx),
+          this.usageSnapshot && !this.usageError ? "info" : "warning",
+        );
     } catch (error) {
       if (this.handleStaleContextError(error, generation) || !this.isGenerationCurrent(generation))
         return;
+      this.usageSnapshot = undefined;
+      this.usageUpdatedAt = undefined;
+      this.credits = null;
       this.usageError = sanitizeDiagnosticError(
         error instanceof Error ? error.message : String(error),
       );
       try {
+        this.updateCredits(ctx);
         this.updateFooter(ctx);
         if (options?.notify) ctx.ui.notify(this.formatStatus(ctx), "warning");
       } catch (secondaryError) {
@@ -255,6 +316,11 @@ export class UsageController {
     this.stopTimer();
     const generation = ++this.sessionGeneration;
     this.shuttingDown = false;
+    this.usageSnapshot = undefined;
+    this.usageUpdatedAt = undefined;
+    this.credits = null;
+    this.usageError = undefined;
+    this.updateCredits(ctx);
 
     const cfg = this.getConfig(ctx);
     if (!cfg.usage.enabled) return;
@@ -276,7 +342,7 @@ export class UsageController {
         return;
       }
       void this.refresh(ctx, undefined, undefined, generation);
-    }, cfg.usage.refreshIntervalMs);
+    }, LOCAL_CHECK_MS);
     this.usageTimer.unref?.();
   }
 
@@ -290,6 +356,7 @@ export class UsageController {
     else {
       this.usageSnapshot = undefined;
       this.usageError = "Usage display is disabled.";
+      this.updateCredits(ctx);
     }
   }
 
@@ -300,5 +367,7 @@ export class UsageController {
     this.usageAbortController?.abort();
     this.usageAbortController = undefined;
     this.stopTimer();
+    this.creditsUpdate = undefined;
+    this.republishCredits();
   }
 }

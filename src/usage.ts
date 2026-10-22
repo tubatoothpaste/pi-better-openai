@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getCodexCredentials } from "./codex-auth.ts";
+import { getCodexCredentials, type CodexCredentials } from "./codex-auth.ts";
 export { AUTH_FILE, readCodexAuth } from "./codex-auth.ts";
 
 export type UsageWindow = {
@@ -16,6 +16,7 @@ export type RateLimitBucket = {
 };
 
 export type CodexUsageResponse = {
+  credits?: { balance?: unknown; unlimited?: unknown } | null;
   rate_limit?: RateLimitBucket | null;
   additional_rate_limits?: Record<string, unknown> | unknown[] | null;
 };
@@ -134,15 +135,40 @@ export async function requestCodexUsage(
   const requestSignal = isAbortSignal(ctxOrSignal) ? ctxOrSignal : signal;
   const credentials = await getCodexCredentials(ctx, requestSignal);
   if (!credentials) return undefined;
+  return requestCodexUsageWithCredentials(credentials, requestSignal);
+}
+
+export class UsageRequestError extends Error {
+  readonly retryAfterMs: number;
+  constructor(retryAfterMs = 0) {
+    super("Codex usage request failed");
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+export async function requestCodexUsageWithCredentials(
+  credentials: CodexCredentials,
+  signal?: AbortSignal,
+): Promise<CodexUsageResponse> {
   const response = await fetch(USAGE_URL, {
     headers: {
       accept: "*/*",
       authorization: `Bearer ${credentials.accessToken}`,
       "chatgpt-account-id": credentials.accountId,
     },
-    signal: requestSignal,
+    signal,
   });
-  if (!response.ok) throw new Error(`Codex usage request failed (${response.status})`);
+  if (!response.ok) {
+    const retry = response.headers.get("retry-after");
+    const delay = retry
+      ? /^\d+$/.test(retry)
+        ? Number(retry) * 1000
+        : Date.parse(retry) - Date.now()
+      : 0;
+    throw new UsageRequestError(
+      Number.isFinite(delay) ? Math.max(0, Math.min(3_600_000, delay)) : 0,
+    );
+  }
   return (await response.json()) as CodexUsageResponse;
 }
 
@@ -191,7 +217,7 @@ function getResetSeconds(window: UsageWindow | null | undefined, now: number): n
     typeof window?.reset_after_seconds === "number" &&
     Number.isFinite(window.reset_after_seconds)
   )
-    return window.reset_after_seconds;
+    return Math.max(0, window.reset_after_seconds);
   if (typeof window?.reset_at !== "number" || !Number.isFinite(window.reset_at)) return null;
   const resetAtSeconds =
     window.reset_at > 100_000_000_000 ? window.reset_at / 1000 : window.reset_at;
