@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import betterOpenAI, { _test } from "../index.ts";
+import { visibleWidth } from "../src/format.ts";
 
 type EventHandler = (event: unknown, ctx: ExtensionContext) => void | Promise<void>;
 type CommandHandler = (args: string, ctx: ExtensionContext) => void | Promise<void>;
@@ -235,6 +236,82 @@ describe("footer mode ownership", () => {
     expect(statusLine.startsWith("MCP: playwright")).toBe(true);
     expect(statusLine.endsWith("C:\\ 50%")).toBe(true);
     expect(statusLine).toHaveLength(50);
+    footer.dispose();
+  });
+
+  test("keeps bottom-suffixed statuses on a dedicated final row", async () => {
+    const cwd = createTempProject();
+    writeProjectConfig(cwd, "replace");
+    const harness = createHarness(cwd);
+
+    await emit(harness, "session_start");
+    const footerFactory = harness.setFooter.mock.calls[0]?.[0];
+    const footer = footerFactory(
+      { requestRender: vi.fn() },
+      { fg: (_color: string, value: string) => value },
+      {
+        getExtensionStatuses: () =>
+          new Map([
+            ["mcp", "MCP: playwright"],
+            ["resource-usage:00:right", "CPU 10%"],
+            ["resource-usage:01:right", "GPU 20%"],
+            ["resource-usage:02:right", "RAM 30%"],
+            ["deepgram-usage:bottom", "Deepgram Aug 2m 4s · 3 reqs"],
+          ]),
+      },
+    );
+
+    const wideLines = footer.render(80);
+    expect(wideLines.at(-2)).toContain("CPU 10% · GPU 20% · RAM 30%");
+    expect(wideLines.at(-1)).toBe("Deepgram Aug 2m 4s · 3 reqs");
+
+    const narrowLines = footer.render(24);
+    const deepgramIndex = narrowLines.findIndex((line: string) => line.startsWith("Deepgram"));
+    const resourceIndexes = narrowLines
+      .map((line: string, index: number) => (/CPU|GPU|RAM/.test(line) ? index : -1))
+      .filter((index: number) => index >= 0);
+    expect(deepgramIndex).toBe(narrowLines.length - 1);
+    expect(resourceIndexes.length).toBeGreaterThan(0);
+    expect(resourceIndexes.every((index: number) => index < deepgramIndex)).toBe(true);
+    footer.dispose();
+  });
+
+  test("renders Deepgram and Pi version as separate final rows after wrapped resources", async () => {
+    const cwd = createTempProject();
+    writeProjectConfig(cwd, "replace");
+    const harness = createHarness(cwd);
+    await emit(harness, "session_start");
+    const statuses = new Map([
+      // Deliberately reversed: the status keys define the display order.
+      ["pi-version:bottom", "Pi v0.80.6-session"],
+      ["deepgram-usage:bottom", "Deepgram loading…"],
+      ["mcp", "MCP: playwright"],
+      ["resource-usage:00:right", "CPU 10%"],
+      ["resource-usage:01:right", "GPU 20%"],
+      ["resource-usage:02:right", "RAM 30%"],
+    ]);
+    const footer = harness.setFooter.mock.calls[0]?.[0](
+      { requestRender: vi.fn() },
+      { fg: (_color: string, value: string) => value },
+      { getExtensionStatuses: () => statuses },
+    );
+    for (const deepgram of [
+      "Deepgram loading…",
+      "Deepgram 6m · 4 reqs",
+      "Deepgram request failed",
+    ]) {
+      statuses.set("deepgram-usage:bottom", deepgram);
+      for (const width of [24, 80, 160]) {
+        const lines = footer.render(width);
+        expect(lines.slice(-2)).toEqual([deepgram, "Pi v0.80.6-session"]);
+        expect(lines.slice(0, -2).join("\n")).toContain("CPU 10%");
+        expect(lines.slice(0, -2).join("\n")).toContain("MCP: playwright");
+        expect(lines.every((line: string) => visibleWidth(line) <= width)).toBe(true);
+      }
+    }
+    statuses.delete("deepgram-usage:bottom");
+    statuses.delete("pi-version:bottom");
+    expect(footer.render(80).join("\n")).not.toMatch(/Deepgram|Pi v/);
     footer.dispose();
   });
 

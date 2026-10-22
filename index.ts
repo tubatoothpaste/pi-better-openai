@@ -79,6 +79,7 @@ const FLAG = "fast";
 const PET_EMPTY_VALUE = "not selected";
 const SERVICE_TIER = "priority";
 const RIGHT_ALIGNED_STATUS_SUFFIX = ":right";
+const BOTTOM_ROW_STATUS_SUFFIX = ":bottom";
 type SettingsPickerItem = {
   id: string;
   label: string;
@@ -1047,15 +1048,16 @@ export default function betterOpenAI(pi: ExtensionAPI): void {
           if (extensionStatuses?.size) {
             const leftStatuses: string[] = [];
             const rightStatuses: string[] = [];
+            const bottomStatuses: string[] = [];
             for (const [key, text] of Array.from(extensionStatuses.entries()).sort(([a], [b]) =>
               String(a).localeCompare(String(b)),
             )) {
               const status = sanitizeStatusText(String(text));
               if (!status) continue;
-              (String(key).endsWith(RIGHT_ALIGNED_STATUS_SUFFIX)
-                ? rightStatuses
-                : leftStatuses
-              ).push(status);
+              const statusKey = String(key);
+              if (statusKey.endsWith(BOTTOM_ROW_STATUS_SUFFIX)) bottomStatuses.push(status);
+              else if (statusKey.endsWith(RIGHT_ALIGNED_STATUS_SUFFIX)) rightStatuses.push(status);
+              else leftStatuses.push(status);
             }
             textLines.push(
               ...layoutFooterStatusLines(
@@ -1065,6 +1067,12 @@ export default function betterOpenAI(pi: ExtensionAPI): void {
                 theme.fg("dim", " · "),
               ),
             );
+            // Each bottom status owns a row (for example, Deepgram then Pi version).
+            for (const status of bottomStatuses) {
+              textLines.push(
+                ...layoutFooterStatusLines([status], [], footerTextWidth, theme.fg("dim", " · ")),
+              );
+            }
           }
 
           const petLines = petController.renderPetLines(ctx, cfg, {
