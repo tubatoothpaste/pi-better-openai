@@ -42,6 +42,16 @@ Usage display and image generation require pi's `openai-codex` OAuth credentials
   - `/openai-usage` shows current OpenAI subscription usage.
   - `/openai-settings` opens settings, diagnostics, and config details.
 
+## Extension status placement
+
+In replacement-footer mode, extensions can publish through `ctx.ui.setStatus(key, text)` without taking over the footer:
+
+- `:after-usage` suffix: each status gets a separate row immediately below `Usage:`, before MCP and resource statuses. If usage is hidden, these rows follow the token/model statistics. The global `usage-credits` extension uses this for a read-only cached Codex credit balance; this renderer does not fetch credits.
+- `:right` suffix: resource segments share/wrap with regular statuses.
+- `:bottom` suffix: each status gets a separate final row, such as Deepgram then Pi version.
+
+Keys sort within their groups. Text is sanitized and constrained to the available terminal width, including inline-pet layouts. Remove a status by setting it to `undefined`. Run `/reload` in existing sessions after changing the renderer or producer. Other footer modes/renderers may lay out statuses differently.
+
 ## Configuration
 
 The extension reads JSON config from two locations:

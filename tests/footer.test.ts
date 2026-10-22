@@ -5,6 +5,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { afterEach, describe, expect, test, vi } from "vitest";
 import betterOpenAI, { _test } from "../index.ts";
 import { visibleWidth } from "../src/format.ts";
+import { UsageController } from "../src/usage-controller.ts";
 
 type EventHandler = (event: unknown, ctx: ExtensionContext) => void | Promise<void>;
 type CommandHandler = (args: string, ctx: ExtensionContext) => void | Promise<void>;
@@ -132,6 +133,7 @@ async function emit(harness: Harness, event: string, payload: unknown = {}) {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const tempDir of tempDirs.splice(0)) {
     rmSync(tempDir, { recursive: true, force: true });
   }
@@ -236,6 +238,48 @@ describe("footer mode ownership", () => {
     expect(statusLine.startsWith("MCP: playwright")).toBe(true);
     expect(statusLine.endsWith("C:\\ 50%")).toBe(true);
     expect(statusLine).toHaveLength(50);
+    footer.dispose();
+  });
+
+  test("renders credits directly after usage and before MCP/resources without taking footer ownership", async () => {
+    const cwd = createTempProject();
+    writeProjectConfig(cwd, "replace");
+    const usage = vi
+      .spyOn(UsageController.prototype, "statusLine")
+      .mockReturnValue("Usage: 5h: 0% | 7d: --");
+    const harness = createHarness(cwd);
+    await emit(harness, "session_start");
+    const statuses = new Map([
+      ["mcp", "MCP: playwright"],
+      ["resource-usage:00:right", "CPU 10%"],
+      ["usage-credits:after-usage", "Usage credits: 54,053.09 remaining"],
+      ["deepgram-usage:bottom", "Deepgram 1h"],
+      ["pi-version:bottom", "Pi v1.3.0"],
+    ]);
+    const footer = harness.setFooter.mock.calls[0]?.[0](
+      { requestRender: vi.fn() },
+      { fg: (_color: string, value: string) => value },
+      { getExtensionStatuses: () => statuses },
+    );
+    for (const creditText of [
+      "Usage credits: 54,053.09 remaining",
+      "Usage credits: unavailable",
+      "Usage credits: 0.00 remaining · stale: 3m old",
+    ]) {
+      statuses.set("usage-credits:after-usage", creditText);
+      for (const width of [24, 80, 160]) {
+        const lines: string[] = footer.render(width);
+        const i = lines.findIndex((line) => line.startsWith("Usage:"));
+        expect(lines[i + 1]).toMatch(/^Usage credits:/);
+        expect(lines.findIndex((line) => line.startsWith("MCP:"))).toBeGreaterThan(i + 1);
+        expect(lines.slice(-2)).toEqual(["Deepgram 1h", "Pi v1.3.0"]);
+        expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
+      }
+    }
+    usage.mockReturnValue(undefined);
+    expect(footer.render(80)[2]).toContain("Usage credits:");
+    statuses.delete("usage-credits:after-usage");
+    expect(footer.render(80).join("\n")).not.toContain("Usage credits:");
     footer.dispose();
   });
 

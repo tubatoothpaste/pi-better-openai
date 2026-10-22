@@ -80,6 +80,7 @@ const PET_EMPTY_VALUE = "not selected";
 const SERVICE_TIER = "priority";
 const RIGHT_ALIGNED_STATUS_SUFFIX = ":right";
 const BOTTOM_ROW_STATUS_SUFFIX = ":bottom";
+const AFTER_USAGE_STATUS_SUFFIX = ":after-usage";
 type SettingsPickerItem = {
   id: string;
   label: string;
@@ -1049,15 +1050,23 @@ export default function betterOpenAI(pi: ExtensionAPI): void {
             const leftStatuses: string[] = [];
             const rightStatuses: string[] = [];
             const bottomStatuses: string[] = [];
+            const afterUsageStatuses: string[] = [];
             for (const [key, text] of Array.from(extensionStatuses.entries()).sort(([a], [b]) =>
               String(a).localeCompare(String(b)),
             )) {
               const status = sanitizeStatusText(String(text));
               if (!status) continue;
               const statusKey = String(key);
-              if (statusKey.endsWith(BOTTOM_ROW_STATUS_SUFFIX)) bottomStatuses.push(status);
+              if (statusKey.endsWith(AFTER_USAGE_STATUS_SUFFIX)) afterUsageStatuses.push(status);
+              else if (statusKey.endsWith(BOTTOM_ROW_STATUS_SUFFIX)) bottomStatuses.push(status);
               else if (statusKey.endsWith(RIGHT_ALIGNED_STATUS_SUFFIX)) rightStatuses.push(status);
               else leftStatuses.push(status);
+            }
+            // Dedicated supplemental usage rows precede MCP/resource status rows.
+            for (const status of afterUsageStatuses) {
+              textLines.push(
+                ...layoutFooterStatusLines([status], [], footerTextWidth, theme.fg("dim", " · ")),
+              );
             }
             textLines.push(
               ...layoutFooterStatusLines(
